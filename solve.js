@@ -1,12 +1,6 @@
-// Fast drop-in for csv-reader 1.0.0 (make.fun csv-reader-speed-01).
-// Same answers, byte for byte (see v1 comments for the policy).
-// Speed: most records take the fast path -- one indexOf('\n') per record
-// to find its end, then one indexOf(',') per unquoted field and one
-// indexOf('"') per quoted field, one slice per field. No per-field LF/CR
-// scans: a record is fast only when its first physical line holds no CR
-// other than a trailing CRLF one, so no stray CR and no CR inside quotes
-// can hide in it. Anything else (multiline quoted field, stray CR, quote
-// junk, unterminated quote) falls back to the precise slow parser.
+// v9: v5 with the fast path inlined into the main loop (no per-record
+// closure call), so a cold process runs one hot function. Slow path is
+// v5's readUnquoted/readQuoted/slowRecord unchanged.
 export function run(input) {
   const text = String(input.text);
   const header = input.header === true;
@@ -107,7 +101,6 @@ export function run(input) {
     if (fValue.length > value.length) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
   }
 
-  // Parse one record with the precise (slow) parser. Returns its fields.
   function slowRecord() {
     const fields = [];
     for (;;) {
@@ -117,105 +110,6 @@ export function run(input) {
       if (fEnded !== 0) break;
     }
     return fields;
-  }
-
-  // Try the fast path for the record starting at pos. On success it
-  // advances pos/line and returns the fields; on any broken case it
-  // returns null without changing pos, line or errors. Unlike v2 it also
-  // handles quoted fields that span physical lines: after such a field
-  // it recomputes the record's line end for the continuation line.
-  function fastRecord() {
-    const start = pos;
-    const startLine = line;
-    let lfIdx = text.indexOf('\n', start);
-    let lineEnd = lfIdx === -1 ? n : lfIdx;
-    let hasLF = lfIdx !== -1;
-    let internalLines = 0;
-    const crPos = text.indexOf('\r', start);
-    if (crPos !== -1 && crPos < lineEnd) {
-      if (!(hasLF && crPos === lineEnd - 1)) return null;
-      if (!hasLF) return null;
-    }
-    const fields = [];
-    let p = start;
-    for (;;) {
-      if (text.charCodeAt(p) === 34) {
-        fQuoted = true;
-        const open = p;
-        let q0 = p + 1;
-        let parts = null;
-        let close = -1;
-        let hasDouble = false;
-        for (;;) {
-          const q = text.indexOf('"', q0);
-          if (q === -1) return null; // unterminated
-          if (text.charCodeAt(q + 1) === 34) {
-            hasDouble = true;
-            if (parts === null) parts = [];
-            parts.push(text.slice(q0, q + 1));
-            q0 = q + 2; continue;
-          }
-          close = q; break;
-        }
-        let value;
-        if (close < lineEnd) {
-          // No LF inside (lineEnd is the first LF), and the record's
-          // first line is CR-clean, so no CR inside either. Only doubled
-          // quotes need work, and the scan already collected them.
-          if (!hasDouble) value = text.slice(open + 1, close);
-          else { parts.push(text.slice(q0, close)); value = parts.join(''); }
-        } else {
-          // Multiline quoted field: chunked build, doubled quotes collapse,
-          // CR/CRLF/LF inside -> LF, counting the lines it spans.
-          const ps = [];
-          let i = open + 1;
-          while (i < close) {
-            const q = text.indexOf('"', i);
-            const r = text.indexOf('\r', i);
-            const l = text.indexOf('\n', i);
-            let m = close; let kind = 0;
-            if (q !== -1 && q < m) { m = q; kind = 1; }
-            if (r !== -1 && r < m) { m = r; kind = 2; }
-            if (l !== -1 && l < m) { m = l; kind = 3; }
-            if (kind === 0) { ps.push(text.slice(i, close)); break; }
-            if (kind === 1) { ps.push(text.slice(i, m + 1)); i = m + 2; continue; }
-            if (kind === 2) { ps.push(text.slice(i, m)); ps.push('\n'); internalLines += 1; i = m + (text.charCodeAt(m + 1) === 10 ? 2 : 1); continue; }
-            ps.push(text.slice(i, m)); ps.push('\n'); internalLines += 1; i = m + 1;
-          }
-          value = ps.length === 1 ? ps[0] : ps.join('');
-        }
-        const nxt = close + 1;
-        if (nxt > lineEnd) {
-          // The quoted field spanned physical lines: recompute the
-          // continuation line's end and its CR cleanliness.
-          lfIdx = text.indexOf('\n', nxt);
-          lineEnd = lfIdx === -1 ? n : lfIdx;
-          hasLF = lfIdx !== -1;
-          const cr2 = text.indexOf('\r', nxt);
-          if (cr2 !== -1 && cr2 < lineEnd) {
-            if (!(hasLF && cr2 === lineEnd - 1)) return null;
-            if (!hasLF) return null;
-          }
-        }
-        if (nxt >= n) { fields.push(value); pos = n; line = startLine + internalLines; return fields; }
-        if (nxt === lineEnd) { fields.push(value); pos = lineEnd + 1; line = startLine + internalLines + 1; return fields; }
-        const nc = text.charCodeAt(nxt);
-        if (nc === 44) { fields.push(value); p = nxt + 1; continue; }
-        if (nc === 13 && nxt + 1 === lineEnd) { fields.push(value); pos = lineEnd + 1; line = startLine + internalLines + 1; return fields; }
-        return null; // quote junk
-      }
-      fQuoted = false;
-      const comma = text.indexOf(',', p);
-      if (comma === -1 || comma >= lineEnd) {
-        let end = lineEnd;
-        if (hasLF && end > p && text.charCodeAt(end - 1) === 13) end -= 1;
-        fields.push(text.slice(p, end));
-        if (hasLF) { pos = lineEnd + 1; line = startLine + internalLines + 1; } else { pos = n; line = startLine + internalLines; }
-        return fields;
-      }
-      fields.push(text.slice(p, comma));
-      p = comma + 1;
-    }
   }
 
   for (;;) {
@@ -228,7 +122,94 @@ export function run(input) {
     if (pos >= n) break;
     recordLine = line;
     recordRow = header && columns === null ? null : rows.length;
-    let fields = fastRecord();
+    let fields = null;
+    fast: {
+      const start = pos;
+      const startLine = line;
+      let lfIdx = text.indexOf('\n', start);
+      let lineEnd = lfIdx === -1 ? n : lfIdx;
+      let hasLF = lfIdx !== -1;
+      let internalLines = 0;
+      const crPos = text.indexOf('\r', start);
+      if (crPos !== -1 && crPos < lineEnd) {
+        if (!(hasLF && crPos === lineEnd - 1)) break fast;
+        if (!hasLF) break fast;
+      }
+      const f = [];
+      let p = start;
+      let lastQuoted = false;
+      for (;;) {
+        if (text.charCodeAt(p) === 34) {
+          lastQuoted = true;
+          const open = p;
+          let q0 = p + 1;
+          let parts = null;
+          let close = -1;
+          let hasDouble = false;
+          for (;;) {
+            const q = text.indexOf('"', q0);
+            if (q === -1) break fast; // unterminated
+            if (text.charCodeAt(q + 1) === 34) {
+              hasDouble = true;
+              if (parts === null) parts = [];
+              parts.push(text.slice(q0, q + 1));
+              q0 = q + 2; continue;
+            }
+            close = q; break;
+          }
+          let value;
+          if (close < lineEnd) {
+            if (!hasDouble) value = text.slice(open + 1, close);
+            else { parts.push(text.slice(q0, close)); value = parts.join(''); }
+          } else {
+            const ps = [];
+            let i = open + 1;
+            while (i < close) {
+              const q = text.indexOf('"', i);
+              const r = text.indexOf('\r', i);
+              const l = text.indexOf('\n', i);
+              let m = close; let kind = 0;
+              if (q !== -1 && q < m) { m = q; kind = 1; }
+              if (r !== -1 && r < m) { m = r; kind = 2; }
+              if (l !== -1 && l < m) { m = l; kind = 3; }
+              if (kind === 0) { ps.push(text.slice(i, close)); break; }
+              if (kind === 1) { ps.push(text.slice(i, m + 1)); i = m + 2; continue; }
+              if (kind === 2) { ps.push(text.slice(i, m)); ps.push('\n'); internalLines += 1; i = m + (text.charCodeAt(m + 1) === 10 ? 2 : 1); continue; }
+              ps.push(text.slice(i, m)); ps.push('\n'); internalLines += 1; i = m + 1;
+            }
+            value = ps.length === 1 ? ps[0] : ps.join('');
+          }
+          const nxt = close + 1;
+          if (nxt > lineEnd) {
+            lfIdx = text.indexOf('\n', nxt);
+            lineEnd = lfIdx === -1 ? n : lfIdx;
+            hasLF = lfIdx !== -1;
+            const cr2 = text.indexOf('\r', nxt);
+            if (cr2 !== -1 && cr2 < lineEnd) {
+              if (!(hasLF && cr2 === lineEnd - 1)) break fast;
+              if (!hasLF) break fast;
+            }
+          }
+          if (nxt >= n) { f.push(value); pos = n; line = startLine + internalLines; fields = f; fQuoted = lastQuoted; break; }
+          if (nxt === lineEnd) { f.push(value); pos = lineEnd + 1; line = startLine + internalLines + 1; fields = f; fQuoted = lastQuoted; break; }
+          const nc = text.charCodeAt(nxt);
+          if (nc === 44) { f.push(value); p = nxt + 1; continue; }
+          if (nc === 13 && nxt + 1 === lineEnd) { f.push(value); pos = lineEnd + 1; line = startLine + internalLines + 1; fields = f; fQuoted = lastQuoted; break; }
+          break fast; // quote junk
+        }
+        lastQuoted = false;
+        const comma = text.indexOf(',', p);
+        if (comma === -1 || comma >= lineEnd) {
+          let end = lineEnd;
+          if (hasLF && end > p && text.charCodeAt(end - 1) === 13) end -= 1;
+          f.push(text.slice(p, end));
+          if (hasLF) { pos = lineEnd + 1; line = startLine + internalLines + 1; } else { pos = n; line = startLine + internalLines; }
+          fields = f; fQuoted = lastQuoted; break;
+        }
+        f.push(text.slice(p, comma));
+        p = comma + 1;
+      }
+    }
     if (fields === null) fields = slowRecord();
     // A line left with a single empty unquoted field is no record
     // (a lone stray-CR line; its errors stay). fQuoted is the last
